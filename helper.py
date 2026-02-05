@@ -544,6 +544,7 @@ def run_moving_mesh(
     state0: qz.NBodyState,
     *,
     cfg: RunConfig,
+    jit_step: bool = False,
     verbose_every: int = 25,
 ) -> RunResult:
     """Run the moving-mesh APM flow (qzoom_nbody_flow.step_nbody_apm)."""
@@ -584,36 +585,67 @@ def run_moving_mesh(
 
     state = state0
     last_diag: Dict[str, Any] = {}
-    t0 = time.perf_counter()
-    for it in range(1, int(cfg.ntotal) + 1):
-        state, def_field, defp_field, phi, diag = qz.step_nbody_apm(
-            state,
-            def_field,
-            defp_field,
+    step_jit = None
+    if jit_step:
+        step_jit = qz.make_step_nbody_apm_jit_with_diag(
             params=params,
             mg_params=mg_params,
             kappa=float(cfg.kappa),
             smooth_steps=int(cfg.smooth_steps),
             limiter=limiter,
-            densinit=densinit,
-            dt=dt,
-            dtold=dtold,
         )
-        last_diag = dict(diag)
+    t0 = time.perf_counter()
+    for it in range(1, int(cfg.ntotal) + 1):
+        if jit_step:
+            state, def_field, defp_field, phi, diag = step_jit(
+                state,
+                def_field,
+                defp_field,
+                dt,
+                dtold,
+                densinit,
+            )
+
+            # Minimal diagnostics for parity with the non-JIT path.
+            last_diag = {
+                "sqrt_g_new_min": float(diag.sqrt_g_new_min),
+                "phi_rms": float(diag.phi_rms),
+                "disp_max": float(diag.disp_max),
+                "vmax": float(diag.vmax),
+                "amax": float(diag.amax),
+                "K": float(diag.K),
+                "U": float(diag.U),
+                "E": float(diag.E),
+            }
+        else:
+            state, def_field, defp_field, phi, diag = qz.step_nbody_apm(
+                state,
+                def_field,
+                defp_field,
+                params=params,
+                mg_params=mg_params,
+                kappa=float(cfg.kappa),
+                smooth_steps=int(cfg.smooth_steps),
+                limiter=limiter,
+                densinit=densinit,
+                dt=dt,
+                dtold=dtold,
+            )
+            last_diag = dict(diag)
 
         # Fail-fast if anything goes non-finite; keep partial outputs for debugging.
-        sg_min = float(diag.get("sqrt_g_new_min", diag.get("sqrt_g_min", np.nan)))
+        sg_min = float(last_diag.get("sqrt_g_new_min", last_diag.get("sqrt_g_min", np.nan)))
         sg_ok = np.isfinite(sg_min) and (sg_min > 0.0)
-        if not sg_ok or not np.isfinite(float(diag.get("phi_rms", np.nan))) or not np.isfinite(float(diag.get("disp_max", np.nan))):
+        if not sg_ok or not np.isfinite(float(last_diag.get("phi_rms", np.nan))) or not np.isfinite(float(last_diag.get("disp_max", np.nan))):
             print(f"[{name} moving] STOP: non-finite or invalid mesh detected at step {it} (sqrt_g_min={sg_min}).")
             break
 
         dt_hist.append(dt)
-        sgmin_hist.append(float(diag.get("sqrt_g_new_min", diag.get("sqrt_g_min", np.nan))))
-        dispmax_hist.append(float(diag.get("disp_max", np.nan)))
-        K_hist.append(float(diag.get("K", np.nan)))
-        U_hist.append(float(diag.get("U", np.nan)))
-        E_hist.append(float(diag.get("E", np.nan)))
+        sgmin_hist.append(float(last_diag.get("sqrt_g_new_min", last_diag.get("sqrt_g_min", np.nan))))
+        dispmax_hist.append(float(last_diag.get("disp_max", np.nan)))
+        K_hist.append(float(last_diag.get("K", np.nan)))
+        U_hist.append(float(last_diag.get("U", np.nan)))
+        E_hist.append(float(last_diag.get("E", np.nan)))
 
         # Physical COM each step (periodic, minimal-image around box center).
         x_phys = np.array(particles_phys(state, def_field, dx, box), dtype=np.float64)
@@ -627,8 +659,8 @@ def run_moving_mesh(
         if not np.isfinite(float(dt_mesh)) or float(dt_mesh) <= 0.0:
             dt_mesh = float("inf")
 
-        vmax = float(diag.get("vmax", np.nan))
-        amax = float(diag.get("amax", np.nan))
+        vmax = float(last_diag.get("vmax", np.nan))
+        amax = float(last_diag.get("amax", np.nan))
         dt_vel = float("inf") if (not np.isfinite(vmax) or vmax <= 0.0) else float(cfg.cfl_part) * dx / vmax
         dt_acc = float("inf") if (not np.isfinite(amax) or amax <= 0.0) else np.sqrt(2.0 * float(cfg.cfl_part) * dx / amax)
 

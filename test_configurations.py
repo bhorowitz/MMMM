@@ -124,6 +124,13 @@ def main() -> None:
     ap.add_argument("--smooth-steps", type=int, default=2)
     ap.add_argument("--a", type=float, default=1.0)
 
+    # Performance / execution
+    ap.add_argument(
+        "--jit-moving",
+        action="store_true",
+        help="Use the GPU/JIT-friendly moving-mesh step (no per-step Python diagnostics).",
+    )
+
     # Limiter
     g_lim = ap.add_mutually_exclusive_group()
     g_lim.add_argument("--limiter", dest="limiter", action="store_true", help="Enable the mesh limiter (recommended).")
@@ -284,7 +291,7 @@ def main() -> None:
         raise SystemExit(f"Unknown scenario {scenario}")
 
     # Run both
-    moving = H.run_moving_mesh(scenario, state0, cfg=cfg)
+    moving = H.run_moving_mesh(scenario, state0, cfg=cfg, jit_step=bool(args.jit_moving))
     static = H.run_static_mesh(scenario, state0, cfg=cfg)
 
     # Metrics (shared)

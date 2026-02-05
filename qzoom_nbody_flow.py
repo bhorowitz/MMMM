@@ -34,7 +34,7 @@ Notes / differences vs Fortran QZOOM
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Tuple, Dict, Any, Optional
+from typing import Tuple, Dict, Any, Optional, NamedTuple
 
 import sys
 from pathlib import Path
@@ -58,6 +58,7 @@ import multigrid_mesh2 as mg  # noqa: E402
 Array = jnp.ndarray
 
 
+@jax.tree_util.register_pytree_node_class
 @dataclass(frozen=True)
 class NBodyState:
     """Particle state (explicit replacement for QZOOM nbody.fip COMMON blocks).
@@ -70,6 +71,15 @@ class NBodyState:
 
     xv: Array
     pmass: Array
+
+    def tree_flatten(self):
+        return (self.xv, self.pmass), None
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        del aux_data
+        xv, pmass = children
+        return cls(xv=xv, pmass=pmass)
 
 
 @dataclass(frozen=True)
@@ -171,14 +181,17 @@ def grad_central(phi: Array, d: float) -> Array:
 
 def smooth7(x: Array, steps: int) -> Array:
     """Isotropic-ish local smoothing: (self + 6 neighbors)/7 repeated."""
-    for _ in range(int(steps)):
-        x = (
-            x
-            + jnp.roll(x, 1, 0) + jnp.roll(x, -1, 0)
-            + jnp.roll(x, 1, 1) + jnp.roll(x, -1, 1)
-            + jnp.roll(x, 1, 2) + jnp.roll(x, -1, 2)
+    steps_i32 = jnp.asarray(steps, dtype=jnp.int32)
+
+    def body(_, y):
+        return (
+            y
+            + jnp.roll(y, 1, 0) + jnp.roll(y, -1, 0)
+            + jnp.roll(y, 1, 1) + jnp.roll(y, -1, 1)
+            + jnp.roll(y, 1, 2) + jnp.roll(y, -1, 2)
         ) / 7.0
-    return x
+
+    return jax.lax.fori_loop(0, steps_i32, body, x)
 
 
 def _qzoom_clip_tmp(tmp: Array, *, xhigh: float, relax_steps: float, dtold: float) -> Array:
@@ -430,46 +443,11 @@ def mesh_dt_from_defp(defp_field: Array, dx: float, *, safety: float = 0.8) -> T
     To avoid an expensive eigen-decomposition on the full grid, we use a cheap
     bound based on the Gershgorin row-sum (spectral radius upper bound).
     """
-    if safety <= 0.0:
-        raise ValueError("safety must be > 0")
-
-    d2 = dx * dx
-
-    hxx = (jnp.roll(defp_field, -1, 0) - 2 * defp_field + jnp.roll(defp_field, 1, 0)) / d2
-    hyy = (jnp.roll(defp_field, -1, 1) - 2 * defp_field + jnp.roll(defp_field, 1, 1)) / d2
-    hzz = (jnp.roll(defp_field, -1, 2) - 2 * defp_field + jnp.roll(defp_field, 1, 2)) / d2
-
-    hxy = (
-        jnp.roll(jnp.roll(defp_field, -1, 0), -1, 1)
-        - jnp.roll(jnp.roll(defp_field, -1, 0), 1, 1)
-        - jnp.roll(jnp.roll(defp_field, 1, 0), -1, 1)
-        + jnp.roll(jnp.roll(defp_field, 1, 0), 1, 1)
-    ) / (4 * d2)
-    hxz = (
-        jnp.roll(jnp.roll(defp_field, -1, 0), -1, 2)
-        - jnp.roll(jnp.roll(defp_field, -1, 0), 1, 2)
-        - jnp.roll(jnp.roll(defp_field, 1, 0), -1, 2)
-        + jnp.roll(jnp.roll(defp_field, 1, 0), 1, 2)
-    ) / (4 * d2)
-    hyz = (
-        jnp.roll(jnp.roll(defp_field, -1, 1), -1, 2)
-        - jnp.roll(jnp.roll(defp_field, -1, 1), 1, 2)
-        - jnp.roll(jnp.roll(defp_field, 1, 1), -1, 2)
-        + jnp.roll(jnp.roll(defp_field, 1, 1), 1, 2)
-    ) / (4 * d2)
-
-    # Gershgorin row-sum bound on max |eigenvalue|.
-    s1 = jnp.abs(hxx) + jnp.abs(hxy) + jnp.abs(hxz)
-    s2 = jnp.abs(hxy) + jnp.abs(hyy) + jnp.abs(hyz)
-    s3 = jnp.abs(hxz) + jnp.abs(hyz) + jnp.abs(hzz)
-    bound = jnp.maximum(jnp.maximum(s1, s2), s3)
-    max_abs = jnp.max(bound)
-
+    dt, max_abs = mesh_dt_from_defp_jax(defp_field, dx, safety=safety)
     max_abs_f = float(max_abs)
     if not np.isfinite(max_abs_f) or max_abs_f <= 0.0:
         return float("inf"), max_abs_f
-    dt = float(safety) / (5.0 * max_abs_f)
-    return dt, max_abs_f
+    return float(dt), max_abs_f
 
 
 # -----------------------------------------------------------------------------
@@ -510,6 +488,19 @@ def cic_deposit_3d(mesh: Array, pos: Array, mass: Array) -> Array:
 
 def cic_readout_3d(field: Array, pos: Array) -> Array:
     """Periodic CIC readout from mesh (positions in mesh coords [0, ng))."""
+    return cic_readout_3d_multi(field[..., None], pos)[..., 0]
+
+
+def cic_readout_3d_multi(field: Array, pos: Array) -> Array:
+    """Periodic CIC readout with a channel axis.
+
+    Args:
+      field: (ng, ng, ng, C)
+      pos: (Np, 3) in mesh coords [0, ng)
+
+    Returns:
+      (Np, C)
+    """
     ng = field.shape[0]
     i0 = jnp.floor(pos).astype(jnp.int32)
     d = pos - i0
@@ -526,7 +517,7 @@ def cic_readout_3d(field: Array, pos: Array) -> Array:
     wz1 = d[:, 2]
 
     def gather(ix, iy, iz):
-        return field[ix, iy, iz]
+        return field[ix, iy, iz, :]
 
     v000 = gather(i0[:, 0], i0[:, 1], i0[:, 2])
     v001 = gather(i0[:, 0], i0[:, 1], i1[:, 2])
@@ -537,14 +528,14 @@ def cic_readout_3d(field: Array, pos: Array) -> Array:
     v110 = gather(i1[:, 0], i1[:, 1], i0[:, 2])
     v111 = gather(i1[:, 0], i1[:, 1], i1[:, 2])
 
-    w000 = wx0 * wy0 * wz0
-    w001 = wx0 * wy0 * wz1
-    w010 = wx0 * wy1 * wz0
-    w011 = wx0 * wy1 * wz1
-    w100 = wx1 * wy0 * wz0
-    w101 = wx1 * wy0 * wz1
-    w110 = wx1 * wy1 * wz0
-    w111 = wx1 * wy1 * wz1
+    w000 = (wx0 * wy0 * wz0)[:, None]
+    w001 = (wx0 * wy0 * wz1)[:, None]
+    w010 = (wx0 * wy1 * wz0)[:, None]
+    w011 = (wx0 * wy1 * wz1)[:, None]
+    w100 = (wx1 * wy0 * wz0)[:, None]
+    w101 = (wx1 * wy0 * wz1)[:, None]
+    w110 = (wx1 * wy1 * wz0)[:, None]
+    w111 = (wx1 * wy1 * wz1)[:, None]
 
     return (
         v000 * w000
@@ -628,18 +619,39 @@ def multigrid(
     U0 = zerosum(U0)
 
     # iopt mod 8 selects operator in QZOOM; we always use the Laplace–Beltrami operator.
-    out = mg.poisson_multigrid(
-        F=rhs0,
-        U=U0,
-        l=int(mg_params.levels),
-        v1=int(mg_params.v1),
-        v2=int(mg_params.v2),
-        mu=int(mg_params.mu),
-        iter_cycle=int(mg_params.cycles),
-        def_field=defpot,
-        h=dx,
-    )
+    #
+    # For GPU/JIT friendliness we route through a cached, `jax.jit`-compiled solver
+    # (multigrid_mesh2.make_poisson_mg_solver), which avoids retracing the full
+    # multigrid Python control flow on every call.
+    solver = _get_poisson_mg_solver(mg_params=mg_params, dx=dx)
+    out = solver(rhs0, U0, defpot)
     return zerosum(out)
+
+
+_POISSON_MG_SOLVER_CACHE: Dict[Tuple[int, int, int, int, int, float], Any] = {}
+
+
+def _get_poisson_mg_solver(*, mg_params: MGParams, dx: float):
+    key = (
+        int(mg_params.levels),
+        int(mg_params.v1),
+        int(mg_params.v2),
+        int(mg_params.mu),
+        int(mg_params.cycles),
+        float(dx),
+    )
+    out = _POISSON_MG_SOLVER_CACHE.get(key)
+    if out is None:
+        out = mg.make_poisson_mg_solver(
+            l=key[0],
+            v1=key[1],
+            v2=key[2],
+            mu=key[3],
+            iter_cycle=key[4],
+            h=key[5],
+        )
+        _POISSON_MG_SOLVER_CACHE[key] = out
+    return out
 
 
 def calcdefp(
@@ -685,6 +697,8 @@ def calcdefp(
     if limiter is None:
         limiter = LimiterParams(enabled=False)
 
+    dtold1 = jnp.asarray(dtold1, dtype=def_field.dtype)
+
     triad = triad_from_def(def_field, dx)
     _, _, sqrt_g = metric_from_triad(triad)
 
@@ -703,7 +717,7 @@ def calcdefp(
         densinit_n = densinit / (mean_mass + 1e-12)
         mass_n = mass_mesh / (mean_mass + 1e-12)
         tmp_n = densinit_n - mass_n
-        tmp_n = _qzoom_clip_tmp(tmp_n, xhigh=float(limiter.xhigh), relax_steps=float(limiter.relax_steps), dtold=float(dtold1))
+        tmp_n = _qzoom_clip_tmp(tmp_n, xhigh=float(limiter.xhigh), relax_steps=float(limiter.relax_steps), dtold=dtold1)
         tmp_n = smooth7(tmp_n, steps=int(limiter.smooth_tmp))
 
         rhs = float(kappa) * tmp_n
@@ -740,31 +754,33 @@ def calcdefp(
     #   - form candidate triad from def + dtold*defp
     #   - compute tlim = 3*(1/cmpmax - 1/compression)/dtold = 3*(1/cmpmax - lam_min)/dtold
     #   - solve Laplacian(defplim) = tlim via FFT and add: defp += defplim
-    if (
-        limiter.enabled
-        and bool(limiter.use_source_term)
-        and float(limiter.hard_strength) != 0.0
-        and dtold1 > 0.0
-    ):
-        # Candidate update uses dtold (QZOOM uses dtold1 here, not dtaumesh).
-        def_cand = def_field + float(dtold1) * out
-        triad_cand = triad_from_def(def_cand, dx)
-        lam_min_lb, _ = triad_gershgorin_bounds(triad_cand)
+    if limiter.enabled and bool(limiter.use_source_term) and float(limiter.hard_strength) != 0.0:
+        dtold_pos = dtold1 > 0.0
+        dtold_safe = jnp.maximum(dtold1, 1e-12)
 
-        # Local compression cap: cmpmax * densinit^{-1/3} (QZOOM limiter.fpp).
-        # densinit_n is normalized so densinit_n~1 for uniform initial mass-per-cell.
-        cmpmax_local = float(limiter.compressmax) * jnp.power(jnp.maximum(densinit_n, 1e-12), -1.0 / 3.0)
-        lam_min_req = 1.0 / jnp.maximum(cmpmax_local, 1.0 + 1e-12)
+        def add_source_term(defp_in: Array) -> Array:
+            # Candidate update uses dtold (QZOOM uses dtold1 here, not dtaumesh).
+            def_cand = def_field + dtold1 * defp_in
+            triad_cand = triad_from_def(def_cand, dx)
+            lam_min_lb, _ = triad_gershgorin_bounds(triad_cand)
 
-        # tlim > 0 when lam_min would fall below the minimum allowed value.
-        tlim = 3.0 * (lam_min_req - lam_min_lb) / jnp.maximum(float(dtold1), 1e-12)
-        tlim = jnp.maximum(tlim, 0.0)
-        tlim = smooth7(tlim, steps=int(limiter.smooth_hard))
+            # Local compression cap: cmpmax * densinit^{-1/3} (QZOOM limiter.fpp).
+            # densinit_n is normalized so densinit_n~1 for uniform initial mass-per-cell.
+            cmpmax_local = float(limiter.compressmax) * jnp.power(jnp.maximum(densinit_n, 1e-12), -1.0 / 3.0)
+            lam_min_req = 1.0 / jnp.maximum(cmpmax_local, 1.0 + 1e-12)
 
-        # Solve Laplacian(corr) = tlim on the *uniform* mesh stencil (QZOOM FFT kernel).
-        corr = poisson_fft_uniform(tlim, dx=dx)
-        out = out + float(limiter.hard_strength) * corr
-        out = smooth7(out, steps=1)
+            # tlim > 0 when lam_min would fall below the minimum allowed value.
+            tlim = 3.0 * (lam_min_req - lam_min_lb) / dtold_safe
+            tlim = jnp.maximum(tlim, 0.0)
+            tlim = smooth7(tlim, steps=int(limiter.smooth_hard))
+            tlim = tlim * dtold_pos.astype(tlim.dtype)  # hard-disable if dtold<=0
+
+            # Solve Laplacian(corr) = tlim on the *uniform* mesh stencil (QZOOM FFT kernel).
+            corr = poisson_fft_uniform(tlim, dx=dx)
+            out2 = defp_in + float(limiter.hard_strength) * corr
+            return smooth7(out2, steps=1)
+
+        out = jax.lax.cond(dtold_pos, add_source_term, lambda x: x, out)
 
     return zerosum(out)
 
@@ -807,7 +823,7 @@ def calcxvdot(
     # QZOOM uses minus central differences, so acceleration is -Ainv·grad(phi) * a
     accel = -jnp.einsum("...ij,...j->...i", Ainv, gphi) * a
 
-    ddef_dt = (defn_field - def_field) / max(dt, 1e-12)
+    ddef_dt = (defn_field - def_field) / jnp.maximum(dt, 1e-12)
     vgrid = grad_central(ddef_dt, dx)  # physical mesh velocity (approx)
 
     return {"Ainv": Ainv, "accel": accel, "vgrid": vgrid}
@@ -834,24 +850,13 @@ def pushparticle(
     v = state.xv[:, 3:6]
 
     # Readout grid fields at particle positions in mesh coordinates.
-    ax = cic_readout_3d(xvdot_fields["accel"][..., 0], xi)
-    ay = cic_readout_3d(xvdot_fields["accel"][..., 1], xi)
-    az = cic_readout_3d(xvdot_fields["accel"][..., 2], xi)
-    a_part = jnp.stack([ax, ay, az], axis=-1)
+    a_part = cic_readout_3d_multi(xvdot_fields["accel"], xi)
 
-    # Read Ainv as 9 scalar fields (CIC each), then reshape.
     Ainv = xvdot_fields["Ainv"]
-    Ainv_ij = []
-    for i in range(3):
-        for j in range(3):
-            Ainv_ij.append(cic_readout_3d(Ainv[..., i, j], xi))
-    Ainv_p = jnp.stack(Ainv_ij, axis=-1).reshape((-1, 3, 3))
+    Ainv_flat = Ainv.reshape(Ainv.shape[0:3] + (9,))
+    Ainv_p = cic_readout_3d_multi(Ainv_flat, xi).reshape((-1, 3, 3))
 
-    vg = xvdot_fields["vgrid"]
-    vg_part = jnp.stack(
-        [cic_readout_3d(vg[..., 0], xi), cic_readout_3d(vg[..., 1], xi), cic_readout_3d(vg[..., 2], xi)],
-        axis=-1,
-    )
+    vg_part = cic_readout_3d_multi(xvdot_fields["vgrid"], xi)
 
     # Velocity update: v_{n+1/2} = v_{n-1/2} + a_n * dt
     v_new = v + a_part * tdt
@@ -1071,3 +1076,413 @@ def step_nbody_apm(
     }
     diagnostics.update(limiter_diag)
     return state_new, defn, defp, phi, diagnostics
+
+
+def mesh_dt_from_defp_jax(defp_field: Array, dx: float, *, safety: float = 0.8) -> Tuple[Array, Array]:
+    """JIT-friendly version of mesh_dt_from_defp.
+
+    Returns:
+      (dt, max_abs) as 0-d JAX arrays.
+    """
+    if safety <= 0.0:
+        raise ValueError("safety must be > 0")
+
+    d2 = dx * dx
+
+    hxx = (jnp.roll(defp_field, -1, 0) - 2 * defp_field + jnp.roll(defp_field, 1, 0)) / d2
+    hyy = (jnp.roll(defp_field, -1, 1) - 2 * defp_field + jnp.roll(defp_field, 1, 1)) / d2
+    hzz = (jnp.roll(defp_field, -1, 2) - 2 * defp_field + jnp.roll(defp_field, 1, 2)) / d2
+
+    hxy = (
+        jnp.roll(jnp.roll(defp_field, -1, 0), -1, 1)
+        - jnp.roll(jnp.roll(defp_field, -1, 0), 1, 1)
+        - jnp.roll(jnp.roll(defp_field, 1, 0), -1, 1)
+        + jnp.roll(jnp.roll(defp_field, 1, 0), 1, 1)
+    ) / (4 * d2)
+    hxz = (
+        jnp.roll(jnp.roll(defp_field, -1, 0), -1, 2)
+        - jnp.roll(jnp.roll(defp_field, -1, 0), 1, 2)
+        - jnp.roll(jnp.roll(defp_field, 1, 0), -1, 2)
+        + jnp.roll(jnp.roll(defp_field, 1, 0), 1, 2)
+    ) / (4 * d2)
+    hyz = (
+        jnp.roll(jnp.roll(defp_field, -1, 1), -1, 2)
+        - jnp.roll(jnp.roll(defp_field, -1, 1), 1, 2)
+        - jnp.roll(jnp.roll(defp_field, 1, 1), -1, 2)
+        + jnp.roll(jnp.roll(defp_field, 1, 1), 1, 2)
+    ) / (4 * d2)
+
+    s1 = jnp.abs(hxx) + jnp.abs(hxy) + jnp.abs(hxz)
+    s2 = jnp.abs(hxy) + jnp.abs(hyy) + jnp.abs(hyz)
+    s3 = jnp.abs(hxz) + jnp.abs(hyz) + jnp.abs(hzz)
+    bound = jnp.maximum(jnp.maximum(s1, s2), s3)
+    max_abs = jnp.max(bound)
+
+    # If bound is invalid or ~0 (defp ~ constant), return dt=+inf to indicate "no restriction".
+    valid = jnp.isfinite(max_abs) & (max_abs > 0.0)
+    dt = jnp.where(valid, safety / (5.0 * max_abs), jnp.inf)
+    return dt, max_abs
+
+
+def make_step_nbody_apm_jit(
+    *,
+    params: APMParams,
+    mg_params: MGParams,
+    kappa: float = 0.1,
+    smooth_steps: int = 2,
+    limiter: Optional[LimiterParams] = None,
+) -> Any:
+    """Build a JIT-compiled APM step function.
+
+    The returned function does **not** compute Python diagnostics (no host sync),
+    so it is safe to use inside long GPU runs / `lax.scan`.
+
+    Signature:
+        step(state, def_field, defp_field, dt, dtold, densinit) ->
+            (state_new, def_new, defp_new, phi)
+
+    Notes:
+      - If limiter is disabled, `densinit` is ignored (pass any array).
+      - `params`, `mg_params`, and `limiter` are captured as static configuration.
+    """
+    dx = float(params.dx())
+    a = float(params.a)
+    ng = int(params.ng)
+    limiter = limiter if limiter is not None else LimiterParams(enabled=False)
+
+    solve_poisson = _get_poisson_mg_solver(mg_params=mg_params, dx=dx)
+
+    kappa_f = float(kappa)
+    smooth_steps_i = int(smooth_steps)
+    compressmax_f = float(limiter.compressmax)
+    skewmax_f = float(limiter.skewmax)
+    backtrack_iters_i = int(limiter.backtrack_iters)
+
+    def limiter_scale_defp_local_gershgorin(def_field: Array, defp_field: Array, dt: Array) -> Array:
+        lam_min_req = 1.0 / compressmax_f
+        lam_max_req = compressmax_f
+
+        def ok(scale: Array) -> Array:
+            defn = def_field + (dt * scale) * defp_field
+            triad = triad_from_def(defn, dx)
+            lam_min_lb, lam_max_ub = triad_gershgorin_bounds(triad)
+            skew_ub = lam_max_ub / jnp.maximum(lam_min_lb, 1e-12)
+            finite = jnp.isfinite(lam_min_lb) & jnp.isfinite(lam_max_ub) & jnp.isfinite(skew_ub)
+            return finite & (lam_min_lb >= lam_min_req) & (lam_max_ub <= lam_max_req) & (skew_ub <= skewmax_f)
+
+        lo = jnp.zeros(def_field.shape, dtype=def_field.dtype)
+        hi = jnp.ones(def_field.shape, dtype=def_field.dtype)
+
+        def body(_, state):
+            lo, hi = state
+            mid = 0.5 * (lo + hi)
+            okm = ok(mid)
+            lo = jnp.where(okm, mid, lo)
+            hi = jnp.where(okm, hi, mid)
+            return (lo, hi)
+
+        lo, _hi = jax.lax.fori_loop(0, backtrack_iters_i, body, (lo, hi))
+        s = jnp.clip(lo, 0.0, 1.0)
+        s = jnp.where(jnp.isfinite(s), s, 0.0)
+        s = smooth7(s, steps=1)
+        return defp_field * s
+
+    def limiter_scale_defp_global_gershgorin(def_field: Array, defp_field: Array, dt: Array) -> Array:
+        lam_min_req = 1.0 / compressmax_f
+        lam_max_req = compressmax_f
+
+        def ok(scale: Array) -> Array:
+            defn = def_field + (dt * scale) * defp_field
+            triad = triad_from_def(defn, dx)
+            lam_min_lb, lam_max_ub = triad_gershgorin_bounds(triad)
+            lam_min_lb_min = jnp.min(lam_min_lb)
+            lam_max_ub_max = jnp.max(lam_max_ub)
+            skew_ub = lam_max_ub_max / jnp.maximum(lam_min_lb_min, 1e-12)
+            finite = jnp.isfinite(lam_min_lb_min) & jnp.isfinite(lam_max_ub_max) & jnp.isfinite(skew_ub)
+            return finite & (lam_min_lb_min >= lam_min_req) & (lam_max_ub_max <= lam_max_req) & (skew_ub <= skewmax_f)
+
+        lo = jnp.array(0.0, dtype=def_field.dtype)
+        hi = jnp.array(1.0, dtype=def_field.dtype)
+
+        def body(_, state):
+            lo, hi = state
+            mid = 0.5 * (lo + hi)
+            okm = ok(mid)
+            lo = jnp.where(okm, mid, lo)
+            hi = jnp.where(okm, hi, mid)
+            return (lo, hi)
+
+        lo, _hi = jax.lax.fori_loop(0, backtrack_iters_i, body, (lo, hi))
+        scale = jnp.clip(lo, 0.0, 1.0)
+        scale = jnp.where(jnp.isfinite(scale), scale, 0.0)
+        # Important: if defp contains NaNs, defp*0 is still NaN; fail closed.
+        return jnp.where(scale > 0.0, defp_field * scale, jnp.zeros_like(defp_field))
+
+    @jax.jit
+    def step(
+        state: NBodyState,
+        def_field: Array,
+        defp_field: Array,
+        dt: Array,
+        dtold: Array,
+        densinit: Array,
+    ):
+        dt = jnp.asarray(dt, dtype=def_field.dtype)
+        dtold = jnp.asarray(dtold, dtype=def_field.dtype)
+
+        # 1) Particle -> rho (mesh)
+        rho0 = jnp.zeros((ng, ng, ng), dtype=def_field.dtype)
+        rho_mesh, sqrt_g = pcalcrho(rho0, def_field, state, dx=dx)
+
+        # 2) Gravity solve
+        rhs_phi = rgzerosum(rho_mesh, def_field, dx)
+        phi0 = jnp.zeros_like(rhs_phi)
+        phi = zerosum(solve_poisson(rhs_phi, phi0, def_field))
+
+        # 3) defp solve
+        u = rho_mesh[None, ...]
+        defp = calcdefp(
+            defp_field,
+            tmp=jnp.zeros_like(rho_mesh),
+            tmp2=jnp.zeros_like(rho_mesh),
+            def_field=def_field,
+            u=u,
+            dtold1=dtold,
+            dtaumesh=dt,
+            nfluid=1,
+            dx=dx,
+            kappa=kappa_f,
+            smooth_steps=smooth_steps_i,
+            densinit=densinit,
+            limiter=limiter,
+            mg_params=mg_params,
+        )
+
+        # 4) Optional post-solve scaling of defp (purely in JAX; no host sync).
+        if limiter.enabled and bool(limiter.use_post_scale):
+            defn_cand = def_field + dt * defp
+            triad_cand = triad_from_def(defn_cand, dx)
+            lam_min_lb, lam_max_ub = triad_gershgorin_bounds(triad_cand)
+            lam_min_lb_min = jnp.min(lam_min_lb)
+            lam_max_ub_max = jnp.max(lam_max_ub)
+            skew_ub = lam_max_ub_max / jnp.maximum(lam_min_lb_min, 1e-12)
+            lam_min_req = 1.0 / compressmax_f
+            lam_max_req = compressmax_f
+            finite = jnp.isfinite(lam_min_lb_min) & jnp.isfinite(lam_max_ub_max) & jnp.isfinite(skew_ub)
+            ok = finite & (lam_min_lb_min >= lam_min_req) & (lam_max_ub_max <= lam_max_req) & (skew_ub <= skewmax_f)
+            need_scale = ~ok if bool(limiter.post_only_on_fail) else jnp.array(True)
+
+            defp = jax.lax.cond(
+                need_scale,
+                lambda d: limiter_scale_defp_local_gershgorin(def_field, d, dt)
+                if limiter.local_limit
+                else limiter_scale_defp_global_gershgorin(def_field, d, dt),
+                lambda d: d,
+                defp,
+            )
+
+        defn = zerosum(def_field + dt * defp)
+
+        # 5) Push particles
+        state_new = stepxv(phi, def_field, defn, dt, dtold, a, state, dx=dx)
+        return state_new, defn, defp, phi
+
+    return step
+
+
+class StepDiagnostics(NamedTuple):
+    sqrt_g_new_min: Array
+    phi_rms: Array
+    disp_max: Array
+    vmax: Array
+    amax: Array
+    K: Array
+    U: Array
+    E: Array
+
+
+def make_step_nbody_apm_jit_with_diag(
+    *,
+    params: APMParams,
+    mg_params: MGParams,
+    kappa: float = 0.1,
+    smooth_steps: int = 2,
+    limiter: Optional[LimiterParams] = None,
+) -> Any:
+    """Like make_step_nbody_apm_jit, but also returns scalar diagnostics as JAX arrays."""
+    dx = float(params.dx())
+    a = float(params.a)
+    ng = int(params.ng)
+    limiter = limiter if limiter is not None else LimiterParams(enabled=False)
+
+    solve_poisson = _get_poisson_mg_solver(mg_params=mg_params, dx=dx)
+
+    kappa_f = float(kappa)
+    smooth_steps_i = int(smooth_steps)
+    compressmax_f = float(limiter.compressmax)
+    skewmax_f = float(limiter.skewmax)
+    backtrack_iters_i = int(limiter.backtrack_iters)
+
+    def limiter_scale_defp_local_gershgorin(def_field: Array, defp_field: Array, dt: Array) -> Array:
+        lam_min_req = 1.0 / compressmax_f
+        lam_max_req = compressmax_f
+
+        def ok(scale: Array) -> Array:
+            defn = def_field + (dt * scale) * defp_field
+            triad = triad_from_def(defn, dx)
+            lam_min_lb, lam_max_ub = triad_gershgorin_bounds(triad)
+            skew_ub = lam_max_ub / jnp.maximum(lam_min_lb, 1e-12)
+            finite = jnp.isfinite(lam_min_lb) & jnp.isfinite(lam_max_ub) & jnp.isfinite(skew_ub)
+            return finite & (lam_min_lb >= lam_min_req) & (lam_max_ub <= lam_max_req) & (skew_ub <= skewmax_f)
+
+        lo = jnp.zeros(def_field.shape, dtype=def_field.dtype)
+        hi = jnp.ones(def_field.shape, dtype=def_field.dtype)
+
+        def body(_, state):
+            lo, hi = state
+            mid = 0.5 * (lo + hi)
+            okm = ok(mid)
+            lo = jnp.where(okm, mid, lo)
+            hi = jnp.where(okm, hi, mid)
+            return (lo, hi)
+
+        lo, _hi = jax.lax.fori_loop(0, backtrack_iters_i, body, (lo, hi))
+        s = jnp.clip(lo, 0.0, 1.0)
+        s = jnp.where(jnp.isfinite(s), s, 0.0)
+        s = smooth7(s, steps=1)
+        return defp_field * s
+
+    def limiter_scale_defp_global_gershgorin(def_field: Array, defp_field: Array, dt: Array) -> Array:
+        lam_min_req = 1.0 / compressmax_f
+        lam_max_req = compressmax_f
+
+        def ok(scale: Array) -> Array:
+            defn = def_field + (dt * scale) * defp_field
+            triad = triad_from_def(defn, dx)
+            lam_min_lb, lam_max_ub = triad_gershgorin_bounds(triad)
+            lam_min_lb_min = jnp.min(lam_min_lb)
+            lam_max_ub_max = jnp.max(lam_max_ub)
+            skew_ub = lam_max_ub_max / jnp.maximum(lam_min_lb_min, 1e-12)
+            finite = jnp.isfinite(lam_min_lb_min) & jnp.isfinite(lam_max_ub_max) & jnp.isfinite(skew_ub)
+            return finite & (lam_min_lb_min >= lam_min_req) & (lam_max_ub_max <= lam_max_req) & (skew_ub <= skewmax_f)
+
+        lo = jnp.array(0.0, dtype=def_field.dtype)
+        hi = jnp.array(1.0, dtype=def_field.dtype)
+
+        def body(_, state):
+            lo, hi = state
+            mid = 0.5 * (lo + hi)
+            okm = ok(mid)
+            lo = jnp.where(okm, mid, lo)
+            hi = jnp.where(okm, hi, mid)
+            return (lo, hi)
+
+        lo, _hi = jax.lax.fori_loop(0, backtrack_iters_i, body, (lo, hi))
+        scale = jnp.clip(lo, 0.0, 1.0)
+        scale = jnp.where(jnp.isfinite(scale), scale, 0.0)
+        # Important: if defp contains NaNs, defp*0 is still NaN; fail closed.
+        return jnp.where(scale > 0.0, defp_field * scale, jnp.zeros_like(defp_field))
+
+    @jax.jit
+    def step(
+        state: NBodyState,
+        def_field: Array,
+        defp_field: Array,
+        dt: Array,
+        dtold: Array,
+        densinit: Array,
+    ):
+        dt = jnp.asarray(dt, dtype=def_field.dtype)
+        dtold = jnp.asarray(dtold, dtype=def_field.dtype)
+
+        # 1) Particle -> rho (mesh)
+        rho0 = jnp.zeros((ng, ng, ng), dtype=def_field.dtype)
+        rho_mesh, sqrt_g = pcalcrho(rho0, def_field, state, dx=dx)
+
+        # 2) Gravity solve
+        rhs_phi = rgzerosum(rho_mesh, def_field, dx)
+        phi0 = jnp.zeros_like(rhs_phi)
+        phi = zerosum(solve_poisson(rhs_phi, phi0, def_field))
+
+        # 3) defp solve
+        u = rho_mesh[None, ...]
+        defp = calcdefp(
+            defp_field,
+            tmp=jnp.zeros_like(rho_mesh),
+            tmp2=jnp.zeros_like(rho_mesh),
+            def_field=def_field,
+            u=u,
+            dtold1=dtold,
+            dtaumesh=dt,
+            nfluid=1,
+            dx=dx,
+            kappa=kappa_f,
+            smooth_steps=smooth_steps_i,
+            densinit=densinit,
+            limiter=limiter,
+            mg_params=mg_params,
+        )
+
+        # 4) Optional post-solve scaling of defp (purely in JAX; no host sync).
+        if limiter.enabled and bool(limiter.use_post_scale):
+            defn_cand = def_field + dt * defp
+            triad_cand = triad_from_def(defn_cand, dx)
+            lam_min_lb, lam_max_ub = triad_gershgorin_bounds(triad_cand)
+            lam_min_lb_min = jnp.min(lam_min_lb)
+            lam_max_ub_max = jnp.max(lam_max_ub)
+            skew_ub = lam_max_ub_max / jnp.maximum(lam_min_lb_min, 1e-12)
+            lam_min_req = 1.0 / compressmax_f
+            lam_max_req = compressmax_f
+            finite = jnp.isfinite(lam_min_lb_min) & jnp.isfinite(lam_max_ub_max) & jnp.isfinite(skew_ub)
+            ok = finite & (lam_min_lb_min >= lam_min_req) & (lam_max_ub_max <= lam_max_req) & (skew_ub <= skewmax_f)
+            need_scale = ~ok if bool(limiter.post_only_on_fail) else jnp.array(True)
+
+            defp = jax.lax.cond(
+                need_scale,
+                lambda d: limiter_scale_defp_local_gershgorin(def_field, d, dt)
+                if limiter.local_limit
+                else limiter_scale_defp_global_gershgorin(def_field, d, dt),
+                lambda d: d,
+                defp,
+            )
+
+        defn = zerosum(def_field + dt * defp)
+
+        # 5) Push particles
+        state_new = stepxv(phi, def_field, defn, dt, dtold, a, state, dx=dx)
+
+        # Diagnostics (scalar reductions only; all stay on device until caller converts).
+        triad_new = triad_from_def(defn, dx)
+        _, _, sqrt_g_new = metric_from_triad(triad_new)
+        sqrt_g_new_min = jnp.min(sqrt_g_new)
+
+        disp = grad_central(defn, dx)
+        disp_mag = jnp.linalg.norm(disp, axis=-1)
+        disp_max = jnp.max(disp_mag)
+
+        phi_rms = jnp.sqrt(jnp.mean(phi * phi))
+        vmax = jnp.max(jnp.linalg.norm(state_new.xv[:, 3:6], axis=-1))
+
+        triad_old = triad_from_def(def_field, dx)
+        Ainv_old = jnp.linalg.inv(triad_old)
+        gphi = grad_central(phi, dx)
+        accel_grid = -jnp.einsum("...ij,...j->...i", Ainv_old, gphi) * a
+        amax = jnp.max(jnp.linalg.norm(accel_grid, axis=-1))
+
+        K = 0.5 * jnp.sum(state_new.pmass * jnp.sum(state_new.xv[:, 3:6] ** 2, axis=-1))
+        U = 0.5 * (dx ** 3) * jnp.sum(rhs_phi * phi * sqrt_g)
+        E = K + U
+
+        diag = StepDiagnostics(
+            sqrt_g_new_min=sqrt_g_new_min,
+            phi_rms=phi_rms,
+            disp_max=disp_max,
+            vmax=vmax,
+            amax=amax,
+            K=K,
+            U=U,
+            E=E,
+        )
+        return state_new, defn, defp, phi, diag
+
+    return step
