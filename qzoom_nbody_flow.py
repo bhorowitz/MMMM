@@ -89,7 +89,7 @@ class MGParams:
     levels: int = 4
     v1: int = 2
     v2: int = 2
-    mu: int = 1
+    mu: int = 2
     cycles: int = 10
 
 

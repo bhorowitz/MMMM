@@ -302,7 +302,8 @@ class PoissonCycle:
     def_field: Array
     v1: int = 2
     v2: int = 2
-    mu: int = 1
+    # mu=1 -> V-cycle, mu=2 -> W-cycle (more generally a "mu-cycle").
+    mu: int = 2
     l: int = 1
     eps: float = 1e-6
     h: float = 1.0
@@ -393,7 +394,7 @@ def make_poisson_mg_solver(
     """Build a custom-VJP MG solver with fixed parameters; def_field is runtime input.
 
     Usage:
-        solve = make_poisson_mg_solver(l=3, v1=2, v2=2, mu=1, iter_cycle=3, h=dx)
+        solve = make_poisson_mg_solver(l=3, v1=2, v2=2, mu=2, iter_cycle=3, h=dx)
         phi = solve(F, U0, def_field)
     """
 

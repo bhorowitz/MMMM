@@ -305,7 +305,7 @@ def main() -> None:
     defp_field = jnp.zeros_like(def_field)
 
     levels = int(np.log2(ng) - 1)
-    mg_params = qz.MGParams(levels=levels, v1=2, v2=2, mu=1, cycles=int(args.mg_cycles))
+    mg_params = qz.MGParams(levels=levels, v1=2, v2=2, mu=2, cycles=int(args.mg_cycles))
     params = qz.APMParams(ng=ng, box=box, a=float(args.a))
 
     limiter = qz.LimiterParams(enabled=False)

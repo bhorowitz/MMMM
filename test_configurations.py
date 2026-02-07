@@ -130,6 +130,11 @@ def main() -> None:
         action="store_true",
         help="Use the GPU/JIT-friendly moving-mesh step (no per-step Python diagnostics).",
     )
+    ap.add_argument(
+        "--compare-jaxpm",
+        action="store_true",
+        help="Also run a static-mesh PM using jaxpm and compare against our static/moving runs.",
+    )
 
     # Limiter
     g_lim = ap.add_mutually_exclusive_group()
@@ -293,11 +298,18 @@ def main() -> None:
     # Run both
     moving = H.run_moving_mesh(scenario, state0, cfg=cfg, jit_step=bool(args.jit_moving))
     static = H.run_static_mesh(scenario, state0, cfg=cfg)
+    jaxpm_static = None
+    if bool(args.compare_jaxpm):
+        jaxpm_static = H.run_static_mesh_jaxpm(scenario, state0, cfg=cfg)
 
     # Metrics (shared)
     metrics = {}
     metrics.update(H.compute_metrics(moving, cfg=cfg, center=center, tag="moving"))
     metrics.update(H.compute_metrics(static, cfg=cfg, center=center, tag="static"))
+    if jaxpm_static is not None:
+        metrics.update(H.compute_metrics(jaxpm_static, cfg=cfg, center=center, tag="jaxpm_static"))
+        metrics.update(H.compare_static_fields_to_jaxpm(static, jaxpm_static, cfg=cfg))
+        metrics.update(H.compare_jaxpm_to_mesh_runs(moving, static, jaxpm_static, cfg=cfg, center=np.array(center, dtype=np.float64)))
 
     # Scenario-specific metrics
     dx = cfg.dx()
@@ -324,6 +336,15 @@ def main() -> None:
     # Save plots
     H.save_summary_figure(moving, out_path=root / "moving_summary.png", cfg=cfg, title=f"{scenario} (moving mesh)")
     H.save_summary_figure(static, out_path=root / "static_summary.png", cfg=cfg, title=f"{scenario} (static mesh)")
+    if jaxpm_static is not None:
+        H.save_summary_figure(jaxpm_static, out_path=root / "jaxpm_static_summary.png", cfg=cfg, title=f"{scenario} (jaxpm static)")
+        H.save_jaxpm_compare_figure(
+            static,
+            jaxpm_static,
+            out_path=root / "jaxpm_compare.png",
+            cfg=cfg,
+            title=f"{scenario}: static PM vs jaxpm static PM",
+        )
     H.save_mesh_vs_phys_figure(moving, out_path=root / "moving_mesh_vs_phys.png", cfg=cfg, title=f"{scenario} (moving mesh)")
     H.save_mesh_vs_phys_figure(static, out_path=root / "static_mesh_vs_phys.png", cfg=cfg, title=f"{scenario} (static mesh)")
     H.save_compare_figure(moving, static, out_path=root / "compare.png", cfg=cfg, title=f"{scenario}: moving vs static (physical grid)")
@@ -344,6 +365,8 @@ def main() -> None:
     # Save analysis bundles for post-processing
     H.save_state_npz(moving, out_path=root / "moving_state.npz", cfg=cfg, center=center)
     H.save_state_npz(static, out_path=root / "static_state.npz", cfg=cfg, center=center)
+    if jaxpm_static is not None:
+        H.save_state_npz(jaxpm_static, out_path=root / "jaxpm_static_state.npz", cfg=cfg, center=center)
 
     (root / "metrics.json").write_text(json.dumps(metrics, indent=2, sort_keys=True))
     print("\n[metrics]")

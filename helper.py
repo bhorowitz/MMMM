@@ -33,6 +33,11 @@ import qzoom_nbody_flow as qz  # noqa: E402
 Array = jnp.ndarray
 
 
+def _minimal_image_jax(d: Array, box: float) -> Array:
+    """JAX version of minimal_image for (N,3) arrays."""
+    return (d + 0.5 * box) % box - 0.5 * box
+
+
 @dataclass(frozen=True)
 class RunConfig:
     ng: int = 64
@@ -554,7 +559,7 @@ def run_moving_mesh(
 
     # Multigrid setup
     levels = int(np.log2(ng) - 1)
-    mg_params = qz.MGParams(levels=levels, v1=2, v2=2, mu=1, cycles=int(cfg.mg_cycles))
+    mg_params = qz.MGParams(levels=levels, v1=2, v2=2, mu=2, cycles=int(cfg.mg_cycles))
     params = qz.APMParams(ng=ng, box=box, a=float(cfg.a))
 
     def_field = jnp.zeros((ng, ng, ng), dtype=jnp.float32)
@@ -834,6 +839,352 @@ def run_static_mesh(
         frames=frames,
         last_diag=last_diag,
     )
+
+
+def _jaxpm_fields_static(
+    xi: Array,
+    pmass: Array,
+    *,
+    ng: int,
+    dx: float,
+    a: float,
+) -> Tuple[Array, Array, Array]:
+    """Compute (rho_mesh, phi, accel_part) using jaxpm's FFT kernels on a static mesh.
+
+    Notes:
+      - Positions are in mesh coordinates [0, ng).
+      - Returned accel is in physical units (per qzoom_nbody_flow conventions).
+      - jaxpm's `cic_read` in jaxpm==0.0.2 appears to be broken; we use the
+        local CIC readout from qzoom_nbody_flow instead.
+    """
+    try:
+        import jaxpm.pm as jpm  # type: ignore
+    except Exception as e:  # pragma: no cover
+        raise RuntimeError("jaxpm is required for --compare-jaxpm (pip install jaxpm==0.0.2).") from e
+
+    mesh_shape = (int(ng), int(ng), int(ng))
+
+    rho_mesh = jpm.cic_paint(jnp.zeros(mesh_shape, dtype=jnp.float32), xi, weight=pmass)
+    rhs = rho_mesh - jnp.mean(rho_mesh)
+
+    delta_k = jnp.fft.rfftn(rhs)
+    kvec = jpm.fftk(mesh_shape)
+    pot_k = delta_k * jpm.invlaplace_kernel(kvec) * jpm.longrange_kernel(kvec, r_split=0)
+    phi = jnp.fft.irfftn(pot_k, s=mesh_shape).real
+    phi = phi - jnp.mean(phi)
+
+    Fx = jnp.fft.irfftn(-jpm.gradient_kernel(kvec, 0) * pot_k, s=mesh_shape).real
+    Fy = jnp.fft.irfftn(-jpm.gradient_kernel(kvec, 1) * pot_k, s=mesh_shape).real
+    Fz = jnp.fft.irfftn(-jpm.gradient_kernel(kvec, 2) * pot_k, s=mesh_shape).real
+    F_grid_xi = jnp.stack([Fx, Fy, Fz], axis=-1)  # d/dxi
+
+    # Convert d/dxi -> d/dx (physical) and apply the same scaling knob `a` as our mesh code.
+    accel_grid = (F_grid_xi / float(dx)) * float(a)
+    accel_part = qz.cic_readout_3d_multi(accel_grid, xi)
+    return rho_mesh, phi, accel_part
+
+
+def step_static_pm_jaxpm(
+    state: qz.NBodyState,
+    *,
+    params: qz.APMParams,
+    dt: float,
+    dtold: float,
+) -> Tuple[qz.NBodyState, Array, Array, Array]:
+    """One static-mesh PM step using jaxpm kernels for the field solve."""
+    ng = int(params.ng)
+    dx = float(params.box) / ng
+
+    xi = state.xv[:, 0:3]
+    v = state.xv[:, 3:6]
+    rho_mesh, phi, accel_part = _jaxpm_fields_static(xi, state.pmass, ng=ng, dx=dx, a=float(params.a))
+
+    v_new = v + accel_part * float(dt)
+    xi_new = xi + (float(dt) / dx) * v_new
+    xi_new = jnp.mod(xi_new, float(ng))
+
+    state_new = qz.NBodyState(xv=state.xv.at[:, 0:3].set(xi_new).at[:, 3:6].set(v_new), pmass=state.pmass)
+    return state_new, phi, rho_mesh, accel_part
+
+
+def run_static_mesh_jaxpm(
+    name: str,
+    state0: qz.NBodyState,
+    *,
+    cfg: RunConfig,
+    verbose_every: int = 25,
+) -> RunResult:
+    """Run static-mesh PM using jaxpm for the FFT field solve (for comparison)."""
+    ng = int(cfg.ng)
+    box = float(cfg.box)
+    dx = cfg.dx()
+    params = qz.APMParams(ng=ng, box=box, a=float(cfg.a))
+
+    def_field = jnp.zeros((ng, ng, ng), dtype=jnp.float32)
+    defp_field = jnp.zeros_like(def_field)
+
+    dt = float(cfg.dt_max)
+    dtold = dt
+    dt_hist: List[float] = []
+    sgmin_hist: List[float] = []
+    dispmax_hist: List[float] = []
+    K_hist: List[float] = []
+    U_hist: List[float] = []
+    E_hist: List[float] = []
+    com_hist: List[np.ndarray] = []
+    frames: List[Dict[str, Any]] = []
+
+    z_anim = int(cfg.mesh_z) if cfg.mesh_z is not None else (ng // 2)
+    z_anim = int(np.clip(z_anim, 0, ng - 1))
+    if bool(cfg.animate):
+        _capture_frame(frames, step=0, state=state0, def_field=def_field, cfg=cfg, z_anim=z_anim)
+
+    state = state0
+    last_diag: Dict[str, Any] = {}
+    phi = jnp.zeros((ng, ng, ng), dtype=jnp.float32)
+    t0 = time.perf_counter()
+    for it in range(1, int(cfg.ntotal) + 1):
+        state, phi, rho_mesh, accel_part = step_static_pm_jaxpm(state, params=params, dt=dt, dtold=dtold)
+        dt_hist.append(dt)
+        sgmin_hist.append(1.0)
+        dispmax_hist.append(0.0)
+
+        # Particle CFL limits for fair comparison against moving mesh.
+        amax = float(jnp.max(jnp.linalg.norm(accel_part, axis=-1)))
+        vmax = float(jnp.max(jnp.linalg.norm(state.xv[:, 3:6], axis=-1)))
+        dt_vel = float("inf") if (not np.isfinite(vmax) or vmax <= 0.0) else float(cfg.cfl_part) * dx / vmax
+        dt_acc = float("inf") if (not np.isfinite(amax) or amax <= 0.0) else float(np.sqrt(2.0 * float(cfg.cfl_part) * dx / amax))
+        dt_next = min(float(cfg.dt_max), float(dt_vel), float(dt_acc))
+        dt_next = max(float(cfg.dt_min), dt_next)
+        dtold = dt
+        dt = dt_next
+
+        # Energy diagnostics
+        rhs = rho_mesh - jnp.mean(rho_mesh)
+        K = 0.5 * jnp.sum(state.pmass * jnp.sum(state.xv[:, 3:6] ** 2, axis=-1))
+        U = 0.5 * (dx ** 3) * jnp.sum(rhs * phi)
+        E = K + U
+        K_hist.append(float(K))
+        U_hist.append(float(U))
+        E_hist.append(float(E))
+
+        # COM history in physical coordinates (def=0 => x=xi*dx)
+        x_phys = np.array(state.xv[:, 0:3] * dx, dtype=np.float64) % box
+        c0 = np.array([0.5 * box, 0.5 * box, 0.5 * box], dtype=np.float64)
+        dcom = minimal_image(x_phys - c0[None, :], box)
+        com = (c0 + np.mean(dcom, axis=0)) % box
+        com_hist.append(com.astype(np.float64))
+
+        last_diag = {
+            "rho_mean": float(jnp.mean(rho_mesh)),
+            "phi_rms": float(jnp.sqrt(jnp.mean(phi * phi))),
+            "vmax": vmax,
+            "amax": amax,
+            "K": float(K),
+            "U": float(U),
+            "E": float(E),
+        }
+
+        if verbose_every and (it % int(verbose_every) == 0 or it == 1 or it == int(cfg.ntotal)):
+            print(f"[{name} jaxpm-static][step {it:04d}/{int(cfg.ntotal)}] dt={dt:.3e} dt_vel={dt_vel:.3e} dt_acc={dt_acc:.3e}")
+
+        if bool(cfg.animate) and (it % int(cfg.anim_every) == 0 or it == int(cfg.ntotal)):
+            _capture_frame(frames, step=it, state=state, def_field=def_field, cfg=cfg, z_anim=z_anim)
+
+    walltime_s = float(time.perf_counter() - t0)
+
+    return RunResult(
+        name=name,
+        mode="jaxpm_static",
+        state=state,
+        def_field=def_field,
+        defp_field=defp_field,
+        phi=phi,
+        dt_hist=np.array(dt_hist, dtype=np.float64),
+        sqrt_g_min_hist=np.array(sgmin_hist, dtype=np.float64),
+        disp_max_hist=np.array(dispmax_hist, dtype=np.float64),
+        K_hist=np.array(K_hist, dtype=np.float64),
+        U_hist=np.array(U_hist, dtype=np.float64),
+        E_hist=np.array(E_hist, dtype=np.float64),
+        com_hist=np.stack(com_hist, axis=0) if com_hist else np.zeros((0, 3), dtype=np.float64),
+        walltime_s=walltime_s,
+        frames=frames,
+        last_diag=last_diag,
+    )
+
+
+def compare_static_fields_to_jaxpm(
+    static: RunResult,
+    jaxpm_static: RunResult,
+    *,
+    cfg: RunConfig,
+) -> Dict[str, float]:
+    """Return comparison metrics between our static mesh PM and jaxpm static PM."""
+    ng = int(cfg.ng)
+    box = float(cfg.box)
+    dx = cfg.dx()
+
+    # Final particle positions (physical)
+    x_sta = static.state.xv[:, 0:3] * dx
+    x_jpm = jaxpm_static.state.xv[:, 0:3] * dx
+    d = _minimal_image_jax(x_sta - x_jpm, box)
+    disp = jnp.linalg.norm(d, axis=-1)
+
+    # Final density fields (mesh coords)
+    rho0 = jnp.zeros((ng, ng, ng), dtype=jnp.float32)
+    def0 = jnp.zeros((ng, ng, ng), dtype=jnp.float32)
+    rho_sta, _ = qz.pcalcrho(rho0, def0, static.state, dx=dx)
+    rho_jpm, _ = qz.pcalcrho(rho0, def0, jaxpm_static.state, dx=dx)
+    rhs_sta = rho_sta - jnp.mean(rho_sta)
+    rhs_jpm = rho_jpm - jnp.mean(rho_jpm)
+    rho_rel = jnp.linalg.norm(rhs_sta - rhs_jpm) / (jnp.linalg.norm(rhs_sta) + 1e-12)
+
+    # Potential fields: mean-subtracted, allow a best-fit scaling (kernels differ).
+    phi_sta = static.phi - jnp.mean(static.phi)
+    phi_jpm = jaxpm_static.phi - jnp.mean(jaxpm_static.phi)
+    alpha_phi = (jnp.vdot(phi_jpm, phi_sta) / (jnp.vdot(phi_jpm, phi_jpm) + 1e-12)).real
+    phi_rel_scaled = jnp.linalg.norm(phi_sta - alpha_phi * phi_jpm) / (jnp.linalg.norm(phi_sta) + 1e-12)
+
+    # Acceleration at particle positions (use each run's field solve).
+    # Static-mesh code acceleration is -grad(phi)*a with central differences.
+    gphi_sta = qz.grad_central(phi_sta, dx)
+    accel_sta_grid = -gphi_sta * float(cfg.a)
+    accel_sta = qz.cic_readout_3d_multi(accel_sta_grid, static.state.xv[:, 0:3])
+
+    # jaxpm acceleration at particle positions (consistent with its kernels).
+    _, _, accel_jpm = _jaxpm_fields_static(jaxpm_static.state.xv[:, 0:3], jaxpm_static.state.pmass, ng=ng, dx=dx, a=float(cfg.a))
+
+    alpha_a = (jnp.vdot(accel_jpm.reshape(-1), accel_sta.reshape(-1)) / (jnp.vdot(accel_jpm.reshape(-1), accel_jpm.reshape(-1)) + 1e-12)).real
+    accel_rel_scaled = jnp.linalg.norm(accel_sta - alpha_a * accel_jpm) / (jnp.linalg.norm(accel_sta) + 1e-12)
+
+    return {
+        "jaxpm_vs_static_pos_rms_over_dx": float(jnp.sqrt(jnp.mean(disp * disp)) / dx),
+        "jaxpm_vs_static_pos_p99_over_dx": float(jnp.quantile(disp, 0.99) / dx),
+        "jaxpm_vs_static_rho_rel_l2": float(rho_rel),
+        "jaxpm_vs_static_phi_scale": float(alpha_phi),
+        "jaxpm_vs_static_phi_rel_l2_scaled": float(phi_rel_scaled),
+        "jaxpm_vs_static_accel_scale": float(alpha_a),
+        "jaxpm_vs_static_accel_rel_l2_scaled": float(accel_rel_scaled),
+    }
+
+
+def compare_jaxpm_to_mesh_runs(
+    moving: RunResult,
+    static: RunResult,
+    jaxpm_static: RunResult,
+    *,
+    cfg: RunConfig,
+    center: np.ndarray,
+) -> Dict[str, float]:
+    """Extra comparisons to highlight that moving mesh deviates from static PM."""
+    ng = int(cfg.ng)
+    box = float(cfg.box)
+    dx = cfg.dx()
+
+    x_mov = np.array(particles_phys(moving.state, moving.def_field, dx, box), dtype=np.float64)
+    x_sta = np.array(static.state.xv[:, 0:3] * dx, dtype=np.float64) % box
+    x_jpm = np.array(jaxpm_static.state.xv[:, 0:3] * dx, dtype=np.float64) % box
+
+    # Position differences (RMS, periodic minimal-image).
+    d_mov = minimal_image(x_mov - x_jpm, box)
+    d_sta = minimal_image(x_sta - x_jpm, box)
+    disp_mov = np.sqrt(np.sum(d_mov * d_mov, axis=-1))
+    disp_sta = np.sqrt(np.sum(d_sta * d_sta, axis=-1))
+
+    # Density on a common physical grid (mass-per-cell).
+    rho_phys_mov = _density_on_uniform_grid(x_mov, ng=ng, box=box, pmass=1.0)
+    rho_phys_sta = _density_on_uniform_grid(x_sta, ng=ng, box=box, pmass=1.0)
+    rho_phys_jpm = _density_on_uniform_grid(x_jpm, ng=ng, box=box, pmass=1.0)
+
+    def rel_l2(a: np.ndarray, b: np.ndarray) -> float:
+        da = a - np.mean(a)
+        db = b - np.mean(b)
+        num = float(np.linalg.norm(da - db))
+        den = float(np.linalg.norm(da) + 1e-12)
+        return num / den
+
+    out = {
+        "jaxpm_vs_moving_pos_rms_over_dx": float(np.sqrt(np.mean(disp_mov * disp_mov)) / dx),
+        "jaxpm_vs_moving_pos_p99_over_dx": float(np.quantile(disp_mov, 0.99) / dx),
+        "jaxpm_vs_static_pos_rms_over_dx_check": float(np.sqrt(np.mean(disp_sta * disp_sta)) / dx),
+        "jaxpm_vs_moving_rho_phys_rel_l2": rel_l2(rho_phys_mov, rho_phys_jpm),
+        "jaxpm_vs_static_rho_phys_rel_l2": rel_l2(rho_phys_sta, rho_phys_jpm),
+    }
+
+    # Optional: compare halo radius quantiles relative to the provided center (scenario-dependent).
+    try:
+        out.update({f"jaxpm_static_{k}": v for k, v in radius_quantiles(x_jpm, center=center, box=box).items()})
+    except Exception:
+        pass
+    return out
+
+
+def save_jaxpm_compare_figure(
+    static: RunResult,
+    jaxpm_static: RunResult,
+    *,
+    out_path: Path,
+    cfg: RunConfig,
+    title: str,
+) -> None:
+    """Save a small figure comparing static PM vs jaxpm static PM (phi + density slices)."""
+    import matplotlib.pyplot as plt
+
+    ng = int(cfg.ng)
+    dx = cfg.dx()
+    z0 = int(cfg.mesh_z) if cfg.mesh_z is not None else (ng // 2)
+    z0 = int(np.clip(z0, 0, ng - 1))
+
+    # Density fields (recomputed from final states for consistency)
+    rho0 = jnp.zeros((ng, ng, ng), dtype=jnp.float32)
+    def0 = jnp.zeros((ng, ng, ng), dtype=jnp.float32)
+    rho_sta, _ = qz.pcalcrho(rho0, def0, static.state, dx=dx)
+    rho_jpm, _ = qz.pcalcrho(rho0, def0, jaxpm_static.state, dx=dx)
+    rhs_sta = rho_sta - jnp.mean(rho_sta)
+    rhs_jpm = rho_jpm - jnp.mean(rho_jpm)
+
+    phi_sta = static.phi - jnp.mean(static.phi)
+    phi_jpm = jaxpm_static.phi - jnp.mean(jaxpm_static.phi)
+    alpha_phi = float((jnp.vdot(phi_jpm, phi_sta) / (jnp.vdot(phi_jpm, phi_jpm) + 1e-12)).real)
+
+    rhs_sta_np = np.array(rhs_sta[:, :, z0], dtype=np.float64)
+    rhs_jpm_np = np.array(rhs_jpm[:, :, z0], dtype=np.float64)
+    phi_sta_np = np.array(phi_sta[:, :, z0], dtype=np.float64)
+    phi_jpm_np = np.array((alpha_phi * phi_jpm)[:, :, z0], dtype=np.float64)
+
+    fig, ax = plt.subplots(2, 3, figsize=(13.5, 8.0))
+    fig.suptitle(title)
+
+    im0 = ax[0, 0].imshow(rhs_sta_np.T, origin="lower", cmap="RdBu_r")
+    ax[0, 0].set_title("static rhs slice")
+    fig.colorbar(im0, ax=ax[0, 0], fraction=0.046)
+
+    im1 = ax[0, 1].imshow(rhs_jpm_np.T, origin="lower", cmap="RdBu_r")
+    ax[0, 1].set_title("jaxpm rhs slice")
+    fig.colorbar(im1, ax=ax[0, 1], fraction=0.046)
+
+    im2 = ax[0, 2].imshow((rhs_sta_np - rhs_jpm_np).T, origin="lower", cmap="RdBu_r")
+    ax[0, 2].set_title("rhs diff")
+    fig.colorbar(im2, ax=ax[0, 2], fraction=0.046)
+
+    im3 = ax[1, 0].imshow(phi_sta_np.T, origin="lower", cmap="magma")
+    ax[1, 0].set_title("static phi slice")
+    fig.colorbar(im3, ax=ax[1, 0], fraction=0.046)
+
+    im4 = ax[1, 1].imshow(phi_jpm_np.T, origin="lower", cmap="magma")
+    ax[1, 1].set_title(f"jaxpm phi slice (scaled x{alpha_phi:.3g})")
+    fig.colorbar(im4, ax=ax[1, 1], fraction=0.046)
+
+    im5 = ax[1, 2].imshow((phi_sta_np - phi_jpm_np).T, origin="lower", cmap="RdBu_r")
+    ax[1, 2].set_title("phi diff")
+    fig.colorbar(im5, ax=ax[1, 2], fraction=0.046)
+
+    for axy in ax.ravel():
+        axy.set_xticks([])
+        axy.set_yticks([])
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=140)
+    plt.close(fig)
 
 
 def save_animation_gif(
