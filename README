@@ -1,0 +1,23 @@
+Simple Two Halo Merger:
+
+python test_configurations.py \           
+  --scenario two_halo_merger \
+  --out halo2.png \
+  --limiter \
+  --animate \
+  --ntotal 300 \
+  --dt-max 0.2 \
+  --cfl-part 0.9 \
+  --kappa 0.35
+
+Cosmological Evolution:
+
+  python test_simulations_z20_to_z2_compare.py \
+  --simdir ./simulations \
+  --outdir ./test_outputs/sim_smoke \
+  --ng-force 64 \
+  --ng-field 128 \
+  --steps 64 \
+  --kappa 0.8 \
+  --limiter \
+  --limiter-mode source
