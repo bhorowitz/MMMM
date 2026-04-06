@@ -194,6 +194,44 @@ def smooth7(x: Array, steps: int) -> Array:
     return jax.lax.fori_loop(0, steps_i32, body, x)
 
 
+def smooth27(x: Array, steps: int) -> Array:
+    """Fortran QZOOM nsmooth: 27-point stencil with exact Fortran weights.
+
+    Weights (sum = 1):
+      self        1/8
+      6 face      1/16 each
+      12 edge     1/32 each
+      8 corner    1/64 each
+
+    Reference: QZOOM/limiter.fpp subroutine nsmooth(a).
+    """
+    steps_i32 = jnp.asarray(steps, dtype=jnp.int32)
+
+    def body(_, y):
+        xp = jnp.roll(y, -1, 0);  xm = jnp.roll(y, 1, 0)
+        yp = jnp.roll(y, -1, 1);  ym = jnp.roll(y, 1, 1)
+        zp = jnp.roll(y, -1, 2);  zm = jnp.roll(y, 1, 2)
+        # face neighbors (6)
+        face = xp + xm + yp + ym + zp + zm
+        # edge neighbors (12)
+        edge = (jnp.roll(xp, -1, 1) + jnp.roll(xp, 1, 1)
+              + jnp.roll(xm, -1, 1) + jnp.roll(xm, 1, 1)
+              + jnp.roll(xp, -1, 2) + jnp.roll(xp, 1, 2)
+              + jnp.roll(xm, -1, 2) + jnp.roll(xm, 1, 2)
+              + jnp.roll(yp, -1, 2) + jnp.roll(yp, 1, 2)
+              + jnp.roll(ym, -1, 2) + jnp.roll(ym, 1, 2))
+        # corner neighbors (8)
+        xpyp = jnp.roll(xp, -1, 1);  xpym = jnp.roll(xp, 1, 1)
+        xmyp = jnp.roll(xm, -1, 1);  xmym = jnp.roll(xm, 1, 1)
+        corner = (jnp.roll(xpyp, -1, 2) + jnp.roll(xpyp, 1, 2)
+                + jnp.roll(xpym, -1, 2) + jnp.roll(xpym, 1, 2)
+                + jnp.roll(xmyp, -1, 2) + jnp.roll(xmyp, 1, 2)
+                + jnp.roll(xmym, -1, 2) + jnp.roll(xmym, 1, 2))
+        return y / 8.0 + face / 16.0 + edge / 32.0 + corner / 64.0
+
+    return jax.lax.fori_loop(0, steps_i32, body, x)
+
+
 def _qzoom_clip_tmp(tmp: Array, *, xhigh: float, relax_steps: float, dtold: float) -> Array:
     """QZOOM-style clipping/scaling of densinit-rho (limiter.fpp).
 
@@ -670,34 +708,26 @@ def calcdefp(
     densinit: Optional[Array] = None,
     limiter: Optional[LimiterParams] = None,
     mg_params: MGParams,
+    compressmax_override: Optional[Array] = None,
 ) -> Array:
-    """Compute deformation-rate potential defp from density contrast (minimal).
+    """Compute deformation-rate potential defp from density contrast.
 
     QZOOM reference: QZOOM/limiter.fpp: subroutine calcdefp(defp,tmp,tmp2,def,u,dtold1,dtaumesh,nfluid)
 
-    QZOOM does:
-      - builds a limiter RHS based on desired constant mass-per-cell
-      - applies smoothing/limiters
-      - solves an elliptic equation for defp via multigrid(defp, tmp, def, u, ..., iopt=2)
-      - smooths defp again and optionally applies additional limiter logic
-
-    Here (N-body only):
-      - we treat u[0] as the mesh *density* field rho_mesh (as returned by pcalcrho)
-      - if limiter.enabled:
-          mimic QZOOM calcdefp1: build tmp = densinit - u(1) in *normalized*
-          units, clip it, divide by ~30*dtold, smooth, then solve for defp.
-          Here u(1) corresponds to rho*sqrt(g), i.e. the per-cell mass in mesh
-          coordinates (Pen 1995 Sec. 5.1).
-      - otherwise:
-          solve a minimal Pen (1995) eq. (10)-style update driven by density
-          contrast, using the sign convention aligned with QZOOM.
+    Differences from earlier port:
+      - Uses smooth27 (Fortran's 27-point nsmooth stencil) instead of smooth7.
+      - dtaumesh is now used to clip the RHS to ±1/dtaumesh (QZOOM limiter.fpp line 413-414).
+      - compressmax_override: optional JAX array that overrides limiter.compressmax (for
+        the Fortran dynamic ramp max(5, min(gcmpmax, 1.1*gcmpmax*a))).
+      - kappa=1.0 matches Fortran (no explicit kappa in Fortran calcdefp1).
     """
-    del tmp2, dtaumesh, nfluid  # ignored in this minimal port
+    del tmp2, nfluid  # tmp2 not needed; nfluid handled via u.shape
 
     if limiter is None:
         limiter = LimiterParams(enabled=False)
 
     dtold1 = jnp.asarray(dtold1, dtype=def_field.dtype)
+    dtaumesh = jnp.asarray(dtaumesh, dtype=def_field.dtype)
 
     triad = triad_from_def(def_field, dx)
     _, _, sqrt_g = metric_from_triad(triad)
@@ -718,15 +748,46 @@ def calcdefp(
         mass_n = mass_mesh / (mean_mass + 1e-12)
         tmp_n = densinit_n - mass_n
         tmp_n = _qzoom_clip_tmp(tmp_n, xhigh=float(limiter.xhigh), relax_steps=float(limiter.relax_steps), dtold=dtold1)
-        tmp_n = smooth7(tmp_n, steps=int(limiter.smooth_tmp))
+        # Fortran nsmooth (27-point stencil) – matches QZOOM calcdefp1 nsmooth(tmp) x3
+        tmp_n = smooth27(tmp_n, steps=int(limiter.smooth_tmp))
 
         rhs = float(kappa) * tmp_n
+
+        # QZOOM limiter.fpp lines 374-376: expansion limiter.
+        # Where det(A) > 10*densinit (mesh too expanded), reverse the flux to
+        # push the mesh back toward the target density — "eflux = -2*abs(eflux)".
+        # Uses densinit_n (normalized), so threshold is sqrt_g/1 > 10.
+        sqrt_g_threshold = 10.0 * jnp.maximum(densinit_n, 1e-12)
+        rhs = jnp.where(sqrt_g > sqrt_g_threshold, -2.0 * jnp.abs(rhs), rhs)
+
+        # QZOOM limiter.fpp lines 408-409: pre-multigrid compression limiter.
+        # Where cells are near the compression limit (lam_min < 1/cmpmax),
+        # only allow expansion (rhs = max(0, rhs)).  Uses Gershgorin bound
+        # on current triad (not candidate).  Fortran: if(tlim>0) eflux=max(0,eflux).
+        cmpmax_rhs = (
+            compressmax_override
+            if compressmax_override is not None
+            else jnp.asarray(float(limiter.compressmax), dtype=def_field.dtype)
+        )
+        cmpmax_local_rhs = cmpmax_rhs * jnp.power(jnp.maximum(densinit_n, 1e-12), -1.0 / 3.0)
+        lam_min_req_rhs = 1.0 / jnp.maximum(cmpmax_local_rhs, 1.0 + 1e-12)
+        lam_min_curr, _ = triad_gershgorin_bounds(triad)
+        near_compress = lam_min_curr < lam_min_req_rhs
+        rhs = jnp.where(near_compress, jnp.maximum(rhs, 0.0), rhs)
+
+        # QZOOM limiter.fpp line 430: 1 extra nsmooth after modifying eflux.
+        rhs = smooth27(rhs, steps=1)
+
+        # QZOOM limiter.fpp lines 413-414: clip eflux to ±1/dtaumesh so mesh can't
+        # move more than ~1 cell per timestep.  dtaumesh>0 enforced by caller.
+        dtaumesh_safe = jnp.maximum(dtaumesh, 1e-12)
+        rhs = jnp.clip(rhs, -1.0 / dtaumesh_safe, 1.0 / dtaumesh_safe)
     else:
         mean_rho = jnp.sum(rho * sqrt_g) / (jnp.sum(sqrt_g) + 1e-12)
         # QZOOM/limiter.fpp uses tmp = densinit - u(1); overdensities should drive
         # a negative RHS and contract the mesh for x = xi + grad(def).
         Ap = mean_rho - rho
-        Ap = smooth7(Ap, steps=int(smooth_steps))
+        Ap = smooth27(Ap, steps=int(smooth_steps))
         rhs = float(kappa) * Ap
 
     out = multigrid(
@@ -745,7 +806,8 @@ def calcdefp(
     )
 
     # QZOOM smooths the raw defp before applying compression limiter corrections.
-    out = smooth7(out, steps=int(limiter.smooth_defp if limiter.enabled else smooth_steps))
+    # Fortran nsmooth (27-point) – matches QZOOM calcdefp1 nsmooth(defp) x2
+    out = smooth27(out, steps=int(limiter.smooth_defp if limiter.enabled else smooth_steps))
 
     # QZOOM-style "repulsive" limiter: modify defp by adding a potential correction
     # that counteracts imminent cell collapse, rather than globally scaling defp.
@@ -758,27 +820,34 @@ def calcdefp(
         dtold_pos = dtold1 > 0.0
         dtold_safe = jnp.maximum(dtold1, 1e-12)
 
+        # Use dynamic compressmax if provided (Fortran ramp: max(5,min(gcmpmax,1.1*gcmpmax*a))).
+        cmpmax_global = (
+            compressmax_override
+            if compressmax_override is not None
+            else jnp.asarray(float(limiter.compressmax), dtype=def_field.dtype)
+        )
+
         def add_source_term(defp_in: Array) -> Array:
             # Candidate update uses dtold (QZOOM uses dtold1 here, not dtaumesh).
             def_cand = def_field + dtold1 * defp_in
             triad_cand = triad_from_def(def_cand, dx)
             lam_min_lb, _ = triad_gershgorin_bounds(triad_cand)
 
-            # Local compression cap: cmpmax * densinit^{-1/3} (QZOOM limiter.fpp).
+            # Local compression cap: cmpmax * densinit^{-1/3} (QZOOM limiter.fpp line 400).
             # densinit_n is normalized so densinit_n~1 for uniform initial mass-per-cell.
-            cmpmax_local = float(limiter.compressmax) * jnp.power(jnp.maximum(densinit_n, 1e-12), -1.0 / 3.0)
+            cmpmax_local = cmpmax_global * jnp.power(jnp.maximum(densinit_n, 1e-12), -1.0 / 3.0)
             lam_min_req = 1.0 / jnp.maximum(cmpmax_local, 1.0 + 1e-12)
 
             # tlim > 0 when lam_min would fall below the minimum allowed value.
             tlim = 3.0 * (lam_min_req - lam_min_lb) / dtold_safe
             tlim = jnp.maximum(tlim, 0.0)
-            tlim = smooth7(tlim, steps=int(limiter.smooth_hard))
+            tlim = smooth27(tlim, steps=int(limiter.smooth_hard))
             tlim = tlim * dtold_pos.astype(tlim.dtype)  # hard-disable if dtold<=0
 
             # Solve Laplacian(corr) = tlim on the *uniform* mesh stencil (QZOOM FFT kernel).
             corr = poisson_fft_uniform(tlim, dx=dx)
             out2 = defp_in + float(limiter.hard_strength) * corr
-            return smooth7(out2, steps=1)
+            return smooth27(out2, steps=1)
 
         out = jax.lax.cond(dtold_pos, add_source_term, lambda x: x, out)
 
