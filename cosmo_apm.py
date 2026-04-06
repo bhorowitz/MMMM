@@ -51,36 +51,42 @@ def _moving_mesh_push_cosmo_fortranish(
 ) -> tuple[qz.NBodyState, Array, Array]:
     """Second-order moving-mesh push consistent with the JAX cosmology state.
 
-    Two time parameters are used with different roles, matching Fortran's calcxvdot:
+    We keep the useful second-order moving-mesh structure from QZOOM, but avoid
+    importing the full Fortran `gdt/gdtold` transport literally. In this JAX path
+    the particle state stores canonical momentum `p=a*v`, so using the full
+    combined interval everywhere tends to over-drag particles with the mesh.
 
-    `tdt` = Fortran's `gdt = dt + dtold` (combined current+previous individual step).
-    Used for all mesh-coupling quantities: mesh velocity denominator, `vm` matrix,
-    and `const_disp` mesh/gravity terms.  This matches how Fortran's `calcxvdot`
-    receives `dt = tdt = gdt` and uses it throughout.
-
-    `dtau` = current individual conformal step.
-    Used only for the KDK velocity kicks (half-kick, half-kick), keeping the kick
-    schedule consistent with the JAX canonical-momentum state convention.
+    Current choices:
+      - `dtau` controls the actual KDK momentum update.
+      - `ddef_dt` is computed over the actual current step `dtau`, because
+        `defn - def_field_cur` is the current-step deformation change.
+      - mesh transport uses a moderated interval: current step plus half of the
+        previous step, with a startup guard so the first step does not double.
+      - we omit the explicit acceleration-drift term from `const_disp` because
+        the canonical momentum kicks already account for that transport.
     """
     triad = qz.triad_from_def(def_field_cur, dx)
     Ainv = jnp.linalg.inv(triad)
 
     gphi = qz.grad_central(phi, dx)
     force_p_grid = -jnp.einsum("...ij,...j->...i", Ainv, gphi) * float(force_scale)
-    accel_u_grid = force_p_grid / (a_mid + 1e-12)
 
-    # Mesh velocity over the combined interval tdt (matches Fortran's calcxvdot dt=gdt).
-    ddef_dt = (defn_field - def_field_cur) / jnp.maximum(tdt, 1e-12)
+    prev_dt = jnp.maximum(tdt - dtau, 0.0)
+    startup = jnp.max(jnp.abs(def_field_cur)) < 1e-12
+    mesh_transport_dt = jnp.where(startup, dtau, dtau + 0.5 * prev_dt)
+
+    # The deformation update defn-def_cur is a current-step quantity, so use dtau
+    # rather than the full combined interval when estimating the mesh-rate field.
+    ddef_dt = (defn_field - def_field_cur) / jnp.maximum(dtau, 1e-12)
     adot = qz.triad_from_def(ddef_dt, dx) - jnp.eye(3, dtype=def_field_cur.dtype)
     bdot = -jnp.einsum("...ik,...kl,...lj->...ij", Ainv, adot, Ainv)
 
     mesh_grad = -qz.grad_central(ddef_dt, dx)
     const_disp = (
-        jnp.einsum("...ij,...j->...i", Ainv, mesh_grad) * tdt
-        + 0.5 * jnp.einsum("...ij,...j->...i", bdot, mesh_grad) * (tdt ** 2)
-        + 0.5 * jnp.einsum("...ij,...j->...i", Ainv, accel_u_grid) * (tdt ** 2)
+        jnp.einsum("...ij,...j->...i", Ainv, mesh_grad) * mesh_transport_dt
+        + 0.5 * jnp.einsum("...ij,...j->...i", bdot, mesh_grad) * (mesh_transport_dt ** 2)
     )
-    vm = Ainv * tdt + 0.5 * bdot * (tdt ** 2)
+    vm = Ainv * mesh_transport_dt + 0.5 * bdot * (mesh_transport_dt ** 2)
 
     xi = state.xv[:, 0:3]
     p = state.xv[:, 3:6]
